@@ -1,7 +1,7 @@
 set -x
 
 stop_strings='["</search>"]'
-tool_function="search_ddg"
+tool_function="examples/interleaved_tool_calling/functions:search_ddg"
 tool_result_tag="info"
 tool_pattern="'<search>(.*?)</search>'"
 tool_kwargs="{num_results: 1}"
@@ -10,8 +10,8 @@ export VLLM_ATTENTION_BACKEND=XFORMERS
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    data.train_files=$HOME/data/gsm8k/train.parquet \
-    data.val_files=$HOME/data/gsm8k/test.parquet \
+    data.train_files=$HOME/data/hotpotqa/train.parquet \
+    data.val_files=$HOME/data/hotpotqa/test.parquet \
     data.train_batch_size=1024 \
     data.max_prompt_length=512 \
     data.max_response_length=1024 \

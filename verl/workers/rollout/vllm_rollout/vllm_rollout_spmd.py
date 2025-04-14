@@ -27,6 +27,7 @@ When working with Megatron:
 import re
 import os
 import numpy as np
+import importlib.util
 from typing import List
 from contextlib import contextmanager
 from omegaconf import DictConfig, OmegaConf
@@ -64,19 +65,31 @@ def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> 
         return np.repeat(value, repeats, axis=0)
 
 
-def search_ddg(query: str, num_results: int = 1) -> str:
-    from duckduckgo_search import DDGS
+def import_search_function(spec: str) -> callable:
+    """
+    Dynamically import a function from a file, given a single string with the pattern:
+    path/to/file[:function_name].
+    """
+    if ":" not in spec:
+        raise ImportError("A path like examples/interleaved_tool_calling/functions:search_ddg must be specified.")
+    
+    module_path, function_name = spec.rsplit(":", 1)
 
-    try:
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=min(num_results, 10)))
-            if not results:
-                return "No results found"
+    spec_obj = importlib.util.spec_from_file_location("tool_function", module_path)
+    if not spec_obj:
+        raise ImportError(f"Could not create a spec for {module_path}")
 
-            summaries = [f"# {r['title']}\n\n {r['body']}" for r in results]
-            return "\n\n".join(summaries)
-    except Exception as e:
-        return f"Error: {str(e)}" 
+    mod = importlib.util.module_from_spec(spec_obj)
+
+    loader = spec_obj.loader
+    if not loader:
+        raise ImportError(f"No loader found for {module_path}")
+    loader.exec_module(mod)
+
+    if not hasattr(mod, function_name):
+        raise AttributeError(f"The module '{module_path}' has no attribute '{function_name}'")
+
+    return getattr(mod, function_name)
 
 
 class vLLMRollout(BaseRollout):
@@ -335,7 +348,7 @@ class vLLMRollout(BaseRollout):
         masks = [[] for _ in range(len(prompts))]
         generated_tokens = [[] for _ in range(len(prompts))]
         active_generations = [True] * len(prompts)
-        tool_function = search_ddg
+        tool_function = import_search_function(self.config.interleaved_generation.tool_function)
         tool_pattern = re.compile(self.config.interleaved_generation.tool_pattern)
         tool_kwargs = OmegaConf.to_container(self.config.interleaved_generation.tool_kwargs, resolve=True)
         stop_strings = OmegaConf.to_container(self.config.interleaved_generation.stop_strings, resolve=True)
