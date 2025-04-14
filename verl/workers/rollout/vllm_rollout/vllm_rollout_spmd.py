@@ -345,7 +345,7 @@ class vLLMRollout(BaseRollout):
 
             # FIXME: veRL does not yet have the ability to add special tokens and resize embeddings
             # We must detokenize to apply interleaved tool calling, stopping on a certain keyword.
-            with self.update_sampling_params(n=1, detokenize=True, stop=self.interleaved_generation.stop_strings):
+            with self.update_sampling_params(n=1, detokenize=True, stop=self.config.interleaved_generation.stop_strings):
                 outputs = self.inference_engine.generate(
                     prompt_token_ids=active_prompts,
                     sampling_params=self.sampling_params,
@@ -367,7 +367,7 @@ class vLLMRollout(BaseRollout):
 
                 if (
                     completion.finish_reason == "stop"
-                    and completion.stop_reason in self.interleaved_generation.stop_strings
+                    and completion.stop_reason in self.config.interleaved_generation.stop_strings
                 ):
                     completion_text = completion.text + completion.stop_reason
                     match = tool_pattern.search(completion_text)
@@ -390,14 +390,14 @@ class vLLMRollout(BaseRollout):
             # Batch process all collected queries
             if search_queries:
                 # TODO: Real batch retrieval
-                search_results = [tool_function(query["query"], **self.interleaved_generation.tool_kwargs) for query in search_queries]
+                search_results = [tool_function(query["query"], **self.config.interleaved_generation.tool_kwargs) for query in search_queries]
 
                 # Process each result and update corresponding request tokens
                 for query, result in zip(search_queries, search_results):
                     request_id = query["request_id"]
                     # minimize tokenization by only encoding retrieved result
                     result_ids = self.tokenizer.encode(
-                        f"<{self.interleaved_generation.tool_result_tag}>{result}</{self.interleaved_generation.tool_result_tag}>", add_special_tokens=False
+                        f"<{self.config.interleaved_generation.tool_result_tag}>{result}</{self.config.interleaved_generation.tool_result_tag}>", add_special_tokens=False
                     )
                     new_tokens_length = len(query["token_ids"]) + len(result_ids)
 
