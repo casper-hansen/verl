@@ -119,7 +119,7 @@ actor_rollout_ref:
       stop_strings: ["</search>"] # stop_strings to trigger tool call
       tool_function: search_ddg # define a custom search function here
       tool_result_tag: "info" # inserted as <info>[tool_function result]</info>
-      tool_pattern: r"<search>(.*?)</search>" # text between tags inserted with tool_function(query=text)
+      tool_pattern: "<search>(.*?)</search>" # text between tags inserted with tool_function(query=text)
       tool_kwargs: {"num_results": 1} # additional parameters for your tool call
 
 critic:
