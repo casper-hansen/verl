@@ -29,7 +29,7 @@ import os
 import numpy as np
 from typing import List
 from contextlib import contextmanager
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 import torch
 import torch.distributed
 from tensordict import TensorDict
@@ -335,9 +335,11 @@ class vLLMRollout(BaseRollout):
         masks = [[] for _ in range(len(prompts))]
         generated_tokens = [[] for _ in range(len(prompts))]
         active_generations = [True] * len(prompts)
-        tool_pattern = re.compile(self.config.interleaved_generation.tool_pattern)
         tool_function = search_ddg
-
+        tool_pattern = re.compile(self.config.interleaved_generation.tool_pattern)
+        tool_kwargs = OmegaConf.to_container(self.config.interleaved_generation.tool_kwargs, resolve=True)
+        stop_strings = OmegaConf.to_container(self.config.interleaved_generation.stop_strings, resolve=True)
+        
         while any(active_generations):
             # Track active requests and their original indices
             active_indices = [i for i, active in enumerate(active_generations) if active]
@@ -345,7 +347,7 @@ class vLLMRollout(BaseRollout):
 
             # FIXME: veRL does not yet have the ability to add special tokens and resize embeddings
             # We must detokenize to apply interleaved tool calling, stopping on a certain keyword.
-            with self.update_sampling_params(n=1, detokenize=True, stop=self.config.interleaved_generation.stop_strings):
+            with self.update_sampling_params(n=1, detokenize=True, stop=stop_strings):
                 outputs = self.inference_engine.generate(
                     prompt_token_ids=active_prompts,
                     sampling_params=self.sampling_params,
@@ -367,7 +369,7 @@ class vLLMRollout(BaseRollout):
 
                 if (
                     completion.finish_reason == "stop"
-                    and completion.stop_reason in self.config.interleaved_generation.stop_strings
+                    and completion.stop_reason in stop_strings
                 ):
                     completion_text = completion.text + completion.stop_reason
                     match = tool_pattern.search(completion_text)
@@ -390,7 +392,7 @@ class vLLMRollout(BaseRollout):
             # Batch process all collected queries
             if search_queries:
                 # TODO: Real batch retrieval
-                search_results = [tool_function(query["query"], **self.config.interleaved_generation.tool_kwargs) for query in search_queries]
+                search_results = [tool_function(query["query"], **tool_kwargs) for query in search_queries]
 
                 # Process each result and update corresponding request tokens
                 for query, result in zip(search_queries, search_results):
