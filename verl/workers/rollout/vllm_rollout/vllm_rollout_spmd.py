@@ -65,13 +65,13 @@ def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> 
         return np.repeat(value, repeats, axis=0)
 
 
-def import_search_function(spec: str) -> callable:
+def import_function(spec: str) -> callable:
     """
     Dynamically import a function from a file, given a single string with the pattern:
     path/to/file[:function_name].
     """
     if ":" not in spec:
-        raise ImportError("A path like examples/interleaved_tool_calling/functions:search_ddg must be specified.")
+        raise ImportError("A path like examples/interleaved_tool_calling/functions.py:search_ddg must be specified.")
     
     module_path, function_name = spec.rsplit(":", 1)
 
@@ -348,7 +348,7 @@ class vLLMRollout(BaseRollout):
         masks = [[] for _ in range(len(prompts))]
         generated_tokens = [[] for _ in range(len(prompts))]
         active_generations = [True] * len(prompts)
-        tool_function = import_search_function(self.config.interleaved_generation.tool_function)
+        tool_function = import_function(self.config.interleaved_generation.tool_function)
         tool_pattern = re.compile(self.config.interleaved_generation.tool_pattern)
         tool_kwargs = OmegaConf.to_container(self.config.interleaved_generation.tool_kwargs, resolve=True)
         stop_strings = OmegaConf.to_container(self.config.interleaved_generation.stop_strings, resolve=True)
