@@ -1,7 +1,7 @@
 set -x
 
 stop_strings='["</search>"]'
-tool_function="examples/interleaved_tool_calling/functions:search_ddg"
+tool_function="examples/interleaved_tool_calling/functions.py:search_ddg"
 tool_result_tag="info"
 tool_pattern="'<search>(.*?)</search>'"
 tool_kwargs="{num_results: 1}"
