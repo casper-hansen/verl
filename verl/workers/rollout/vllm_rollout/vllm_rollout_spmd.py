@@ -24,6 +24,7 @@ When working with Megatron:
 - Do inference in tp. pp is treated as additional dp
 - After inference, all the parameters that doesn't belong to this pp rank is freed.
 """
+import re
 import os
 import numpy as np
 from typing import List
@@ -61,6 +62,21 @@ def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> 
         return value.repeat_interleave(repeats, dim=0)
     else:
         return np.repeat(value, repeats, axis=0)
+
+
+def search_ddg(query: str, num_results: int = 1) -> str:
+    from duckduckgo_search import DDGS
+
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=min(num_results, 10)))
+            if not results:
+                return "No results found"
+
+            summaries = [f"# {r['title']}\n\n {r['body']}" for r in results]
+            return "\n\n".join(summaries)
+    except Exception as e:
+        return f"Error: {str(e)}" 
 
 
 class vLLMRollout(BaseRollout):
@@ -154,6 +170,7 @@ class vLLMRollout(BaseRollout):
         self.sampling_params = SamplingParams(**kwargs)
 
         self.pad_token_id = tokenizer.pad_token_id
+        self.tokenizer = tokenizer
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
@@ -236,21 +253,27 @@ class vLLMRollout(BaseRollout):
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
-            outputs = self.inference_engine.generate(
-                prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
-                use_tqdm=False)
+            if self.config.interleaved_generation.enable:
+                response, generation_mask = self._interleaved_generation(vllm_inputs=vllm_inputs)
 
-            # TODO(sgm): disable logprob when recompute_log_prob is enable
-            # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
+                generation_mask = pad_2d_list_to_length(generation_mask, pad_token_id=0,
+                                            max_length=self.config.response_length).to(idx.device)
+            else:
+                outputs = self.inference_engine.generate(
+                    prompts=vllm_inputs,  # because we have already convert it to prompt token id
+                    sampling_params=self.sampling_params,
+                    use_tqdm=False)
 
-            response = []
-            for output in outputs:
-                for sample_id in range(len(output.outputs)):
-                    response.append(output.outputs[sample_id].token_ids)
+                # TODO(sgm): disable logprob when recompute_log_prob is enable
+                # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
+
+                response = []
+                for output in outputs:
+                    for sample_id in range(len(output.outputs)):
+                        response.append(output.outputs[sample_id].token_ids)
 
             response = pad_2d_list_to_length(response, self.pad_token_id,
-                                             max_length=self.config.response_length).to(idx.device)
+                                            max_length=self.config.response_length).to(idx.device)
 
             if self.sampling_params.n > 1 and do_sample:
                 idx = _repeat_interleave(idx, self.sampling_params.n)
@@ -278,6 +301,9 @@ class vLLMRollout(BaseRollout):
         response_attention_mask = get_response_mask(response_id=response,
                                                     eos_token=eos_token_id,
                                                     dtype=attention_mask.dtype)
+        if self.config.interleaved_generation.enable:
+            # beyond the first EOS and tool result tokens will be 0 in the final mask
+            response_attention_mask = response_attention_mask * generation_mask
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
 
         # all the tp ranks should contain the same data here. data in all ranks are valid
@@ -297,3 +323,94 @@ class vLLMRollout(BaseRollout):
             self.inference_engine.free_cache_engine()
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+
+    def _interleaved_generation(self, vllm_inputs):
+        # In terms of processing, there is no significant efficiency difference between making 8 separate requests
+        # versus using n=8, since vLLM internally converts the n=8 request into 8 separate requests anyway.
+        prompts = [
+            token_sequence["prompt_token_ids"].copy()
+            for token_sequence in vllm_inputs
+            for _ in range(self.sampling_params.n)
+        ]
+        masks = [[] for _ in range(len(prompts))]
+        generated_tokens = [[] for _ in range(len(prompts))]
+        active_generations = [True] * len(prompts)
+        tool_pattern = re.compile(self.config.interleaved_generation.tool_pattern)
+        tool_function = search_ddg
+
+        while any(active_generations):
+            # Track active requests and their original indices
+            active_indices = [i for i, active in enumerate(active_generations) if active]
+            active_prompts = [prompts[i] + generated_tokens[i] for i in active_indices]
+
+            # FIXME: veRL does not yet have the ability to add special tokens and resize embeddings
+            # We must detokenize to apply interleaved tool calling, stopping on a certain keyword.
+            with self.update_sampling_params(n=1, detokenize=True, stop=self.interleaved_generation.stop_strings):
+                outputs = self.inference_engine.generate(
+                    prompt_token_ids=active_prompts,
+                    sampling_params=self.sampling_params,
+                    use_tqdm=False,
+                )
+
+            # Create a mapping from vLLM request IDs to our original indices
+            # vLLM assigns request IDs based on the order we provide the prompts
+            request_id_map = {}
+            for i, output in enumerate(outputs):
+                request_id_map[output.request_id] = active_indices[i]
+
+            # Collect all queries and their corresponding request IDs
+            search_queries = []
+
+            for request in outputs:
+                completion = request.outputs[0]
+                original_request_id = request_id_map[request.request_id]
+
+                if (
+                    completion.finish_reason == "stop"
+                    and completion.stop_reason in self.interleaved_generation.stop_strings
+                ):
+                    completion_text = completion.text + completion.stop_reason
+                    match = tool_pattern.search(completion_text)
+
+                    if match:
+                        search_queries.append(
+                            {
+                                "query": match.group(1).strip(),
+                                "request_id": original_request_id,
+                                "token_ids": completion.token_ids,
+                            }
+                        )
+                        continue
+
+                # No match, generation is done
+                active_generations[original_request_id] = False
+                generated_tokens[original_request_id].extend(completion.token_ids)
+                masks[original_request_id].extend([1] * len(completion.token_ids))
+
+            # Batch process all collected queries
+            if search_queries:
+                # TODO: Real batch retrieval
+                search_results = [tool_function(query["query"], **self.interleaved_generation.tool_kwargs) for query in search_queries]
+
+                # Process each result and update corresponding request tokens
+                for query, result in zip(search_queries, search_results):
+                    request_id = query["request_id"]
+                    # minimize tokenization by only encoding retrieved result
+                    result_ids = self.tokenizer.encode(
+                        f"<{self.interleaved_generation.tool_result_tag}>{result}</{self.interleaved_generation.tool_result_tag}>", add_special_tokens=False
+                    )
+                    new_tokens_length = len(query["token_ids"]) + len(result_ids)
+
+                    if (
+                        len(generated_tokens[request_id]) + new_tokens_length
+                        > self.sampling_params.max_tokens
+                    ):
+                        active_generations[request_id] = False
+                    else:
+                        generated_tokens[request_id].extend(query["token_ids"])
+                        masks[request_id].extend([1] * len(query["token_ids"]))
+                        # mask out the result ids for improved convergence
+                        generated_tokens[request_id].extend(result_ids)
+                        masks[request_id].extend([0] * len(result_ids))
+
+        return generated_tokens, masks
