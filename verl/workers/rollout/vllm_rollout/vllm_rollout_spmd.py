@@ -340,14 +340,15 @@ class vLLMRollout(BaseRollout):
     def _interleaved_generation(self, vllm_inputs):
         # In terms of processing, there is no significant efficiency difference between making 8 separate requests
         # versus using n=8, since vLLM internally converts the n=8 request into 8 separate requests anyway.
-        prompts = [
+        tokens = [
             token_sequence["prompt_token_ids"].copy()
             for token_sequence in vllm_inputs
             for _ in range(self.sampling_params.n)
         ]
-        masks = [[] for _ in range(len(prompts))]
-        generated_tokens = [[] for _ in range(len(prompts))]
-        active_generations = [True] * len(prompts)
+        # Record initial lengths for each prompt to slice out the new “delta” tokens later.
+        initial_prompt_lengths = [len(p) for p in tokens]
+        masks = [[] for _ in range(len(tokens))]
+        active_generations = [True] * len(tokens)
         tool_function = import_function(self.config.interleaved_generation.tool_function)
         tool_pattern = re.compile(self.config.interleaved_generation.tool_pattern)
         tool_kwargs = OmegaConf.to_container(self.config.interleaved_generation.tool_kwargs, resolve=True)
@@ -356,13 +357,13 @@ class vLLMRollout(BaseRollout):
         while any(active_generations):
             # Track active requests and their original indices
             active_indices = [i for i, active in enumerate(active_generations) if active]
-            active_prompts = [prompts[i] + generated_tokens[i] for i in active_indices]
+            active_tokens = [tokens[i] for i in active_indices]
 
             # FIXME: veRL does not yet have the ability to add special tokens and resize embeddings
             # We must detokenize to apply interleaved tool calling, stopping on a certain keyword.
             with self.update_sampling_params(n=1, detokenize=True, stop=stop_strings):
                 outputs = self.inference_engine.generate(
-                    prompt_token_ids=active_prompts,
+                    prompt_token_ids=active_tokens,
                     sampling_params=self.sampling_params,
                     use_tqdm=False,
                 )
@@ -399,7 +400,7 @@ class vLLMRollout(BaseRollout):
 
                 # No match, generation is done
                 active_generations[original_request_id] = False
-                generated_tokens[original_request_id].extend(completion.token_ids)
+                tokens[original_request_id].extend(completion.token_ids)
                 masks[original_request_id].extend([1] * len(completion.token_ids))
 
             # Batch process all collected queries
@@ -417,15 +418,18 @@ class vLLMRollout(BaseRollout):
                     new_tokens_length = len(query["token_ids"]) + len(result_ids)
 
                     if (
-                        len(generated_tokens[request_id]) + new_tokens_length
+                        len(tokens[request_id]) + new_tokens_length
                         > self.sampling_params.max_tokens
                     ):
                         active_generations[request_id] = False
                     else:
-                        generated_tokens[request_id].extend(query["token_ids"])
+                        tokens[request_id].extend(query["token_ids"])
                         masks[request_id].extend([1] * len(query["token_ids"]))
                         # mask out the result ids for improved convergence
-                        generated_tokens[request_id].extend(result_ids)
+                        tokens[request_id].extend(result_ids)
                         masks[request_id].extend([0] * len(result_ids))
 
-        return generated_tokens, masks
+        # Use initial_prompt_lengths to get newly generated tokens
+        deltas = [tokens[i][initial_prompt_lengths[i]:] for i in range(len(tokens))]
+
+        return deltas, masks
