@@ -26,9 +26,13 @@ When working with Megatron:
 """
 import re
 import os
+import time
+import asyncio
+import aiohttp
 import numpy as np
 import importlib.util
-from typing import List
+from collections import deque
+from typing import List, Callable, Dict
 from contextlib import contextmanager
 from omegaconf import DictConfig, OmegaConf
 import torch
@@ -91,6 +95,76 @@ def import_function(spec: str) -> callable:
 
     return getattr(mod, function_name)
 
+
+def _batch_process_queries(
+    tool_function: Callable,
+    search_queries: List[Dict[str, Any]],
+    tool_kwargs: Dict[str, Any],
+    max_calls_per_second: int = 10
+) -> List[Any]:
+    """
+    Process queries concurrently with a rolling-window rate limit,
+    using aiohttp for real async I/O to reduce overhead.
+    
+    Args:
+        tool_function: The async function to call for each query
+        search_queries: List of query dictionaries
+        tool_kwargs: Additional keyword arguments for the tool function
+        max_calls_per_second: Maximum number of tool function calls per second
+        
+    Returns:
+        List of results in the same order as the input queries
+    """
+    
+    class RateLimiter:
+        """A simple rolling-window rate limiter for async calls."""
+        def __init__(self, calls_per_second: int):
+            self.calls_per_second = calls_per_second
+            self.call_timestamps = deque()
+            self.lock = asyncio.Lock()
+
+        async def wait(self):
+            """
+            Ensure we do not exceed 'calls_per_second' in a trailing 1-second window.
+            If at capacity, wait until there's room.
+            """
+            async with self.lock:
+                now = time.monotonic()
+                
+                # Remove old calls that are more than 1 second old
+                while self.call_timestamps and self.call_timestamps[0] <= now - 1:
+                    self.call_timestamps.popleft()
+
+                # If at the limit, wait
+                if len(self.call_timestamps) >= self.calls_per_second:
+                    sleep_time = 1 - (now - self.call_timestamps[0])
+                    await asyncio.sleep(sleep_time)
+
+                    # Remove old timestamps again after waiting
+                    now = time.monotonic()
+                    while self.call_timestamps and self.call_timestamps[0] <= now - 1:
+                        self.call_timestamps.popleft()
+
+                # Add new call timestamp
+                self.call_timestamps.append(now)
+    
+    async def execute_query(rate_limiter, session, query):
+        # Request permission from rate limiter
+        await rate_limiter.wait()
+        return await tool_function(query["query"], session, **tool_kwargs)
+    
+    async def process_all_queries():
+        rate_limiter = RateLimiter(max_calls_per_second)
+        
+        # Reuse a single aiohttp session for all requests
+        async with aiohttp.ClientSession() as session:
+            tasks = [
+                asyncio.create_task(execute_query(rate_limiter, session, q))
+                for q in search_queries
+            ]
+            return await asyncio.gather(*tasks)
+
+    return asyncio.run(process_all_queries())
 
 class vLLMRollout(BaseRollout):
 
@@ -407,8 +481,12 @@ class vLLMRollout(BaseRollout):
 
             # Batch process all collected queries
             if search_queries:
-                # TODO: Real batch retrieval
-                search_results = [tool_function(query["query"], **tool_kwargs) for query in search_queries]
+                search_results = _batch_process_queries(
+                    tool_function,
+                    search_queries,
+                    tool_kwargs,
+                    max_calls_per_second=50,
+                )
 
                 # Process each result and update corresponding request tokens
                 for query, result in zip(search_queries, search_results):

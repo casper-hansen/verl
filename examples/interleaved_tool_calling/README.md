@@ -8,7 +8,7 @@ This example showcases tool calling during generation of a token sequence with v
 
 ## Example behavior
 
-In this example, the goal is to teach the model to query a search engine. We use DuckDuckGo as it requires no API keys and zero setup. Below, you can find an example of the desired behavior we want to elicit in the model.
+In this example, the goal is to teach the model to query a search engine. Below, you can find an example of the desired behavior we want to elicit in the model.
 
 ```
 <|im_start|>system
@@ -24,7 +24,7 @@ Based on the search results, veRL seems to be a post-training library for large 
 
 ## Getting started with training
 
-First, you need to `pip install duckduckgo_search mathruler` for this example to work.
+First, you need to `pip install mathruler` for this example to work.
 
 Then you can run the script `bash run_qwen2_5-7b.sh`, in which you can modify the following parameters:
 - `stop_strings`: The stop string that triggers the inference engine to pause to execute the search before resuming generation.
