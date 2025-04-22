@@ -25,22 +25,16 @@ When working with Megatron:
 - After inference, all the parameters that doesn't belong to this pp rank is freed.
 """
 
-import asyncio
-import aiohttp
-from collections import deque
-import importlib.util
 import logging
 import os
 import re
-import time
 from contextlib import contextmanager
-from omegaconf import DictConfig, OmegaConf
-from typing import Any, List, Union, Callable, Dict
+from typing import Any, List, Union
 
 import numpy as np
 import torch
 import torch.distributed
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
 from vllm import LLM, SamplingParams
 from vllm.distributed import parallel_state as vllm_ps
@@ -48,6 +42,7 @@ from vllm.distributed import parallel_state as vllm_ps
 from verl import DataProto
 from verl.third_party.vllm import vllm_version
 from verl.utils.debug import GPUMemoryLogger
+from verl.utils.tools import batch_process_queries
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
 
@@ -75,103 +70,6 @@ def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> 
     else:
         return np.repeat(value, repeats, axis=0)
 
-
-def import_function(spec: str) -> callable:
-    """
-    Dynamically import a function from a file, given a single string with the pattern:
-    path/to/file[:function_name].
-    """
-    if ":" not in spec:
-        raise ImportError("A path like examples/interleaved_tool_calling/functions.py:search_ddg must be specified.")
-    
-    module_path, function_name = spec.rsplit(":", 1)
-
-    spec_obj = importlib.util.spec_from_file_location("tool_function", module_path)
-    if not spec_obj:
-        raise ImportError(f"Could not create a spec for {module_path}")
-
-    mod = importlib.util.module_from_spec(spec_obj)
-
-    loader = spec_obj.loader
-    if not loader:
-        raise ImportError(f"No loader found for {module_path}")
-    loader.exec_module(mod)
-
-    if not hasattr(mod, function_name):
-        raise AttributeError(f"The module '{module_path}' has no attribute '{function_name}'")
-
-    return getattr(mod, function_name)
-
-
-def _batch_process_queries(
-    tool_function: Callable,
-    search_queries: List[Dict[str, Any]],
-    tool_kwargs: Dict[str, Any],
-    max_calls_per_second: int = 10
-) -> List[Any]:
-    """
-    Process queries concurrently with a rolling-window rate limit,
-    using aiohttp for real async I/O to reduce overhead.
-    
-    Args:
-        tool_function: The async function to call for each query
-        search_queries: List of query dictionaries
-        tool_kwargs: Additional keyword arguments for the tool function
-        max_calls_per_second: Maximum number of tool function calls per second
-        
-    Returns:
-        List of results in the same order as the input queries
-    """
-    
-    class RateLimiter:
-        """A simple rolling-window rate limiter for async calls."""
-        def __init__(self, calls_per_second: int):
-            self.calls_per_second = calls_per_second
-            self.call_timestamps = deque()
-            self.lock = asyncio.Lock()
-
-        async def wait(self):
-            """
-            Ensure we do not exceed 'calls_per_second' in a trailing 1-second window.
-            If at capacity, wait until there's room.
-            """
-            async with self.lock:
-                now = time.monotonic()
-                
-                # Remove old calls that are more than 1 second old
-                while self.call_timestamps and self.call_timestamps[0] <= now - 1:
-                    self.call_timestamps.popleft()
-
-                # If at the limit, wait
-                if len(self.call_timestamps) >= self.calls_per_second:
-                    sleep_time = 1 - (now - self.call_timestamps[0])
-                    await asyncio.sleep(sleep_time)
-
-                    # Remove old timestamps again after waiting
-                    now = time.monotonic()
-                    while self.call_timestamps and self.call_timestamps[0] <= now - 1:
-                        self.call_timestamps.popleft()
-
-                # Add new call timestamp
-                self.call_timestamps.append(now)
-    
-    async def execute_query(rate_limiter, session, query):
-        # Request permission from rate limiter
-        await rate_limiter.wait()
-        return await tool_function(query["query"], session, **tool_kwargs)
-    
-    async def process_all_queries():
-        rate_limiter = RateLimiter(max_calls_per_second)
-        
-        # Reuse a single aiohttp session for all requests
-        async with aiohttp.ClientSession() as session:
-            tasks = [
-                asyncio.create_task(execute_query(rate_limiter, session, q))
-                for q in search_queries
-            ]
-            return await asyncio.gather(*tasks)
-
-    return asyncio.run(process_all_queries())
 
 class vLLMRollout(BaseRollout):
     def __init__(self, model_path: str, config: DictConfig, tokenizer, model_hf_config, **kwargs):
@@ -466,7 +364,6 @@ class vLLMRollout(BaseRollout):
         tokens = [[] for _ in range(len(initial_prompts))]
         masks = [[] for _ in range(len(initial_prompts))]
         active_generations = [True] * len(initial_prompts)
-        tool_function = import_function(self.config.interleaved_generation.tool_function)
         tool_pattern = re.compile(self.config.interleaved_generation.tool_pattern)
         tool_kwargs = OmegaConf.to_container(self.config.interleaved_generation.tool_kwargs, resolve=True)
         stop_strings = OmegaConf.to_container(self.config.interleaved_generation.stop_strings, resolve=True)
@@ -525,8 +422,8 @@ class vLLMRollout(BaseRollout):
 
             # Batch process all collected queries
             if search_queries:
-                search_results = _batch_process_queries(
-                    tool_function,
+                search_results = batch_process_queries(
+                    self.config.interleaved_generation.tool_function,
                     search_queries,
                     tool_kwargs,
                     max_calls_per_second=50,
